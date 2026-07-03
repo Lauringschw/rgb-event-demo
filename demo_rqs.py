@@ -48,6 +48,14 @@ REPLAY_SURF_H   = 432
 CHUNK_CAP  = 4000
 CHUNK_KEEP = 3000
 
+# Always-on live event preview (picture-in-picture, top-right corner)
+LIVE_SURF_W     = 200
+LIVE_SURF_H     = 113                 # 16:9, matches 1280x720 sensor aspect
+LIVE_MARGIN     = 16
+LIVE_WINDOW_US  = 30_000              # rolling 30ms slice
+LIVE_REFRESH_MS = 33                  # ~30fps — decoupled from the 60fps main loop
+LIVE_POS        = (W - LIVE_SURF_W - LIVE_MARGIN, LIVE_MARGIN)
+
 
 # ============== model =================================================
 
@@ -150,6 +158,23 @@ def build_replay_frame(evs: np.ndarray, t_end: int) -> pygame.Surface:
     x  = (frame_evs['x'].astype(np.int32) * REPLAY_SURF_W // 1280).clip(0, REPLAY_SURF_W - 1)
     y  = (frame_evs['y'].astype(np.int32) * REPLAY_SURF_H // 720 ).clip(0, REPLAY_SURF_H - 1)
     p  = frame_evs['p']
+    px = pygame.surfarray.pixels3d(surf)
+    on = p == 1
+    px[x[on],  y[on]]  = C_GREEN
+    px[x[~on], y[~on]] = C_RED
+    del px
+    return surf
+
+
+def build_live_frame(evs: np.ndarray) -> pygame.Surface:
+    """Renders a raw event slice into the small always-on PIP surface."""
+    surf = pygame.Surface((LIVE_SURF_W, LIVE_SURF_H))
+    surf.fill(C_BG)
+    if evs.size == 0:
+        return surf
+    x  = (evs['x'].astype(np.int32) * LIVE_SURF_W // 1280).clip(0, LIVE_SURF_W - 1)
+    y  = (evs['y'].astype(np.int32) * LIVE_SURF_H // 720 ).clip(0, LIVE_SURF_H - 1)
+    p  = evs['p']
     px = pygame.surfarray.pixels3d(surf)
     on = p == 1
     px[x[on],  y[on]]  = C_GREEN
@@ -296,6 +321,7 @@ class UI:
         self.f_big   = pygame.font.SysFont('dejavusans',  68, bold=True)
         self.f_med   = pygame.font.SysFont('dejavusans',  44)
         self.f_small = pygame.font.SysFont('dejavusans',  30)
+        self.f_tiny  = pygame.font.SysFont('dejavusans',  16, bold=True)
 
     def text(self, msg, font, color, cx, cy):
         s = font.render(str(msg), True, color)
@@ -318,6 +344,23 @@ class UI:
         color = GEST_COLOR.get(gesture, C_WHITE)
         self.text(label,              self.f_med, C_DIM,  cx, cy - 60)
         self.text(GEST_TEXT[gesture], self.f_big, color,  cx, cy + 10)
+
+    def live_panel(self, live_surf, event_count, cam_ok):
+        """Always-on event PIP — drawn last so it sits above every state, including SPIKE/REPLAY."""
+        x, y = LIVE_POS
+        backing = pygame.Surface((LIVE_SURF_W + 4, LIVE_SURF_H + 26), pygame.SRCALPHA)
+        backing.fill((0, 0, 0, 170))
+        self.screen.blit(backing, (x - 2, y - 2))
+        self.screen.blit(live_surf, (x, y))
+
+        border = C_GREEN if cam_ok else C_RED
+        pygame.draw.rect(self.screen, border, (x, y, LIVE_SURF_W, LIVE_SURF_H), 2)
+
+        dot_y = y + LIVE_SURF_H + 12
+        pygame.draw.circle(self.screen, border, (x + 8, dot_y), 5)
+        label = f'LIVE  {event_count} ev' if cam_ok else 'LIVE  no signal'
+        lbl = self.f_tiny.render(label, True, C_WHITE)
+        self.screen.blit(lbl, (x + 18, dot_y - 8))
 
     def spike_screen(self):
         panel = pygame.Surface((W, H), pygame.SRCALPHA)
@@ -371,10 +414,22 @@ def run(args):
     replay_last_t      = 0
     replay_build_done  = threading.Event()
 
+    # Live PIP (independent of game state — refreshed on its own clock)
+    live_surf         = build_live_frame(np.zeros(0, dtype=[('x', '<u2'), ('y', '<u2'), ('p', 'i1'), ('t', '<i8')]))
+    live_event_count  = 0
+    live_last_refresh = 0
+
     running = True
     while running:
         clock.tick(60)
         now = pygame.time.get_ticks()
+
+        if now - live_last_refresh >= LIVE_REFRESH_MS:
+            live_last_refresh = now
+            t_now             = buf.latest_t()
+            live_evs          = buf.get_window(t_now - LIVE_WINDOW_US, LIVE_WINDOW_US)
+            live_event_count  = int(live_evs.size)
+            live_surf         = build_live_frame(live_evs)
 
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
@@ -520,6 +575,7 @@ def run(args):
                       ui.f_small, C_WHITE, H - 60)
             ui.center('SPACE to play again', ui.f_small, C_DIM, H - 25)
 
+        ui.live_panel(live_surf, live_event_count, buf.latest_t() > 0)
         pygame.display.flip()
 
     stop.set()
